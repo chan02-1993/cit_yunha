@@ -1,0 +1,40 @@
+"text = ""banana""
+d = dict()
+
+for i in range(len(text)):
+    d[text[i]] = 0
+
+for x in range(len(text)):
+    d[text[x]] += 1
+
+print(d)"
+"codes = [""A1"", ""B2"", ""A1"", ""C3"", ""B2"", ""A1""]
+
+d = dict()
+
+for i in range(len(codes)):
+    d[codes[i]] = 0
+
+for x in range(len(codes)):
+    d[codes[x]] += 1
+
+print(d)"
+"score = {""철수"": 88, ""영희"": 92, ""민수"": 79}
+name = """"
+if name in score:
+    print(score[name])
+else:
+    print(""없음"")"
+"price = {""아메리카노"": 4500, ""라떼"": 5000, ""티"": 3000}
+price[""콜드브루""]=5500
+price[""티""]=3500"
+"price = {""아메리카노"": 4500, ""라떼"": 5000, ""티"": 3000}
+for i in price:
+    print(price[i])"
+"price = {""아메리카노"": 4500, ""라떼"": 5000, ""티"": 3000}
+for i in price:
+    print(i)"
+"price = {""아메리카노"": 4500, ""라떼"": 5000, ""티"": 3000}
+print(price[""아메리카노""] + price[""티""])"
+"price = {""아메리카노"": 4500, ""라떼"": 5000, ""티"": 3000}
+print(price['라떼'])"
