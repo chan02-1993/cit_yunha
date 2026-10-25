@@ -1,0 +1,49 @@
+"scores = {""철수"": 95, ""영희"": 82, ""민수"": 68, ""지현"": 74, ""수빈"": 90}
+new_scores = {}
+
+for person in scores:
+
+    if scores[person]>=90:
+        new_scores[person] = ""A""
+    elif scores[person]>=70:
+        new_scores[person] = ""B""
+    else:
+        new_scores[person] = ""C""
+print(new_scores)"
+"order = [""아메리카노"", ""라떼"", ""아메리카노"", ""티""]
+order_count = {}
+for product in order:
+    if product in order_count:
+        order_count[product] += 1
+    else:
+        order_count[product] = 1
+
+print(order_count)"
+"menu = {""아메리카노"": 4500, ""라떼"": 5000, ""티"": 3000}
+order = [""아메리카노"", ""라떼"", ""아메리카노"", ""티""]
+cost = 0
+for product in menu:
+    cost += menu[product]
+
+print(cost)"
+"students = [(""철수"", ""A반""), (""영희"", ""B반""), (""민수"", ""A반""), (""지현"", ""B반"")]
+d = {}
+for i in range(len(students)):
+    d[students[i][1]] = []
+
+
+for i in range(len(students)):
+    d[students[i][1]].append(students[i][0])
+
+print(d)"
+"nums = [11, 22, 13, 24, 35, 46, 17]
+d = {}
+even = ""짝수""
+odd = ""홀수""
+for num in nums:
+    if num/2 == 0:
+        d[even].append(num)
+    else:
+        d[odd].append(num)
+
+print(d)"
