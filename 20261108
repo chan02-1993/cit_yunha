@@ -1,0 +1,27 @@
+"new_sales = {}
+
+sales = [
+(""월"", 12000), (""화"", 8000), (""월"", 5000),
+(""수"", 20000), (""화"", 15000), (""월"", 3000)
+]
+
+for i in range(len(sales)):
+    new_sales[sales[i][0]]=0
+
+for i in range(len(sales)):
+    new_sales[sales[i][0]]+= sales[i][1]
+
+print(new_sales)"
+"text = ""the cat sat on the mat the cat ran""
+d = {}
+
+for word in text:
+    if word in d:
+        d[word] += 1
+    else:
+        d[word] = 1
+
+for word in d:
+    if d[word] >= 2:
+        print(word)
+    "
