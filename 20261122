@@ -1,0 +1,520 @@
+"""공들이 싸우고, 이긴 공이 자식을 낳으며 진화하는 시뮬레이션.
+
+실행 전 설치: pip install pygame
+실행: python battle.py
+
+조작
+  Space      일시정지 / 재개
+  1 ~ 5      배속 (1x, 2x, 4x, 8x, 16x)
+  마우스 클릭  공 선택 → 오른쪽 패널에 능력치 표시
+  R          처음부터 다시
+
+판의 위아래, 좌우는 이어져 있다. 한쪽 끝으로 나가면 반대편에서 나오고,
+추격·도망·공격·거리 계산 모두 경계 너머까지 가장 가까운 방향으로 계산한다.
+  ESC        종료
+"""
+import math
+import random
+
+import pygame
+
+# ------------------------------------------------------------------ 설정 ----
+BOARD_W, BOARD_H = 900, 700
+PANEL_W = 320
+START_COUNT = 100
+START_POINTS = 30
+
+# 능력치: (이름, 기본값, 포인트당 증가량)
+STATS = [
+    ("hp",       "체력",     100.0, 10.0),
+    ("regen",    "체력회복", 0.5,   0.2),   # 초당
+    ("atk",      "공격력",   10.0,  1.0),
+    ("defense",  "방어력",   5.0,   1.0),
+    ("aspd",     "공격속도", 1.0,   0.1),   # 초당 공격 횟수
+    ("move",     "이동속도", 10.0,  1.0),
+]
+MOVE_SCALE = 8.0          # 이동속도 1 = 초당 8픽셀 (기본 10 → 초당 80픽셀)
+
+RADIUS = 14
+ATTACK_GAP = 6            # 몸이 닿고 이만큼 더 가까우면 공격 가능
+DECIDE_EVERY = (9.0, 11.0)   # 행동 갱신 주기(초): 공마다, 갱신할 때마다 이 범위에서 랜덤
+DECIDE_AFTER_EVENT = (4.0, 7.0)  # 죽이거나 근처에서 죽어서 갱신했을 때의 다음 주기
+NEAR_DEATH = RADIUS * 2 * 3  # 지름 3개 거리 안에서 죽거나 죽이면 행동 갱신
+SENSE = 260               # 도망칠 때 신경 쓰는 거리
+CHILD_DIST = (60, 160)    # 자식이 생기는 거리 범위
+POINT_BIAS = 0.04         # 포인트 합이 30에서 1 벗어날 때마다 증가 확률이 이만큼 반대로 기운다
+WEIGHT_MUTATION = 0.25    # 행동 가중치 변동 폭
+
+BEHAVIORS = ["flee", "chase", "wait"]
+BEHAVIOR_KO = {"flee": "도망", "chase": "추격", "wait": "대기"}
+BEHAVIOR_MARK = {"flee": "F", "chase": "C", "wait": "W"}
+
+BG = (24, 26, 34)
+PANEL_BG = (34, 36, 46)
+TEXT = (225, 225, 230)
+DIM = (140, 140, 155)
+
+
+def wrap_delta(ax, ay, bx, by):
+    """판의 위아래·좌우가 이어져 있으므로, a에서 b로 가는 가장 짧은 방향(dx, dy)."""
+    dx = (bx - ax + BOARD_W / 2) % BOARD_W - BOARD_W / 2
+    dy = (by - ay + BOARD_H / 2) % BOARD_H - BOARD_H / 2
+    return dx, dy
+
+
+def wrap_dist(ax, ay, bx, by):
+    return math.hypot(*wrap_delta(ax, ay, bx, by))
+
+
+def stat_value(key, points):
+    for k, _, base, inc in STATS:
+        if k == key:
+            return base + inc * points
+    raise KeyError(key)
+
+
+# ------------------------------------------------------------------ 공 ----
+class Ball:
+    next_id = 1
+
+    def __init__(self, x, y, points, weights, generation=1, parent=None):
+        self.id = Ball.next_id
+        Ball.next_id += 1
+        self.x, self.y = x, y
+        self.points = dict(points)                 # 능력치별 투자 포인트
+        self.weights = list(weights)               # [도망, 추격, 대기] 가중치 (합 1)
+        self.generation = generation
+        self.parent = parent
+
+        self.max_hp = stat_value("hp", self.points["hp"])
+        self.regen = stat_value("regen", self.points["regen"])
+        self.atk = stat_value("atk", self.points["atk"])
+        self.defense = stat_value("defense", self.points["defense"])
+        self.aspd = max(0.05, stat_value("aspd", self.points["aspd"]))
+        self.speed = max(0.0, stat_value("move", self.points["move"])) * MOVE_SCALE
+
+        self.hp = self.max_hp
+        self.cooldown = random.uniform(0, 1 / self.aspd)
+        self.behavior = "wait"
+        self.target = None
+        self.decide_timer = 0.0
+        self.decide_interval = random.uniform(*DECIDE_EVERY)
+        self.kills = 0
+        self.age = 0.0
+        self.flash = 0.0
+        self.alive = True
+
+    @property
+    def color(self):
+        """가중치를 색으로: 빨강 = 추격, 초록 = 도망, 파랑 = 대기.
+        가장 높은 가중치를 255로 놓고 나머지는 그 비율만큼."""
+        flee, chase, wait = self.weights
+        top = max(self.weights)
+        return (int(255 * chase / top), int(255 * flee / top), int(255 * wait / top))
+
+    @property
+    def total_points(self):
+        return sum(self.points.values())
+
+    def delta_to(self, other):
+        return wrap_delta(self.x, self.y, other.x, other.y)
+
+    def dist_to(self, other):
+        return wrap_dist(self.x, self.y, other.x, other.y)
+
+    def decide(self, balls, event=False):
+        """가중치에 따라 확률적으로 행동을 고르고 갱신 카운트를 초기화한다.
+        다음 갱신까지: 평소 9~11초, 사건(처치·근처 죽음)으로 갱신했으면 4~7초."""
+        self.behavior = random.choices(BEHAVIORS, weights=self.weights)[0]
+        self.decide_timer = 0.0
+        self.decide_interval = random.uniform(*(DECIDE_AFTER_EVENT if event else DECIDE_EVERY))
+        self.target = None
+        if self.behavior == "chase":
+            others = [b for b in balls if b is not self and b.alive]
+            if others:
+                self.target = min(others, key=self.dist_to)
+
+
+# ------------------------------------------------------------ 생성/유전 ----
+def random_points(total=START_POINTS):
+    pts = {k: 0 for k, *_ in STATS}
+    keys = list(pts)
+    for _ in range(total):
+        pts[random.choice(keys)] += 1
+    return pts
+
+
+def random_weights():
+    w = [random.random() + 0.05 for _ in BEHAVIORS]
+    s = sum(w)
+    return [v / s for v in w]
+
+
+def child_points(parent_points):
+    """각 능력치를 하나씩 +1 또는 -1.
+    부모가 30보다 많이 썼으면 -1 쪽, 적게 썼으면 +1 쪽으로 확률이 기운다."""
+    total = sum(parent_points.values())
+    p_up = 0.5 - POINT_BIAS * (total - START_POINTS)
+    p_up = max(0.05, min(0.95, p_up))
+    pts = {}
+    for k, v in parent_points.items():
+        pts[k] = max(0, v + (1 if random.random() < p_up else -1))
+    return pts
+
+
+def child_weights(parent_weights):
+    w = [v * math.exp(random.gauss(0, WEIGHT_MUTATION)) for v in parent_weights]
+    s = sum(w)
+    return [max(0.01, v / s) for v in w]
+
+
+def free_spot(balls, near=None, dist_range=None, tries=300):
+    """다른 공과 겹치지 않는 빈자리를 찾는다."""
+    for _ in range(tries):
+        if near:
+            a = random.uniform(0, 2 * math.pi)
+            d = random.uniform(*dist_range)
+            x = (near.x + math.cos(a) * d) % BOARD_W
+            y = (near.y + math.sin(a) * d) % BOARD_H
+        else:
+            x = random.uniform(0, BOARD_W)
+            y = random.uniform(0, BOARD_H)
+        if all(wrap_dist(b.x, b.y, x, y) > RADIUS * 2 + 30 for b in balls if b.alive):
+            return x, y
+    return None
+
+
+def make_start_balls():
+    balls = []
+    for _ in range(START_COUNT):
+        x, y = free_spot(balls)
+        balls.append(Ball(x, y, random_points(), random_weights()))
+    return balls
+
+
+# ------------------------------------------------------------ 공간 격자 ----
+class Grid:
+    """판을 칸으로 나눠, 가까운 공만 빠르게 찾는다 (공이 많아도 느려지지 않게).
+    위아래·좌우가 이어진 판에 맞춰 칸 번호도 반대편으로 이어진다."""
+    COLS = max(1, BOARD_W // 40)
+    ROWS = max(1, BOARD_H // 40)
+    CW = BOARD_W / COLS
+    CH = BOARD_H / ROWS
+
+    def __init__(self, balls):
+        self.cells = {}
+        for b in balls:
+            key = (int(b.x / self.CW) % self.COLS, int(b.y / self.CH) % self.ROWS)
+            self.cells.setdefault(key, []).append(b)
+
+    def near(self, x, y, radius):
+        """(x, y)에서 radius 안에 있을 수 있는 공들 (조금 더 넓게 돌려준다)."""
+        cx, cy = int(x / self.CW), int(y / self.CH)
+        rx = min(int(radius / self.CW) + 1, self.COLS // 2)
+        ry = min(int(radius / self.CH) + 1, self.ROWS // 2)
+        cols = {(cx + i) % self.COLS for i in range(-rx, rx + 1)}
+        rows = {(cy + j) % self.ROWS for j in range(-ry, ry + 1)}
+        out = []
+        cells = self.cells
+        for i in cols:
+            for j in rows:
+                lst = cells.get((i, j))
+                if lst:
+                    out.extend(lst)
+        return out
+
+
+# ------------------------------------------------------------ 시뮬레이션 ----
+class World:
+    def __init__(self):
+        Ball.next_id = 1
+        self.balls = make_start_balls()
+        for b in self.balls:
+            b.decide(self.balls)
+        self.time = 0.0
+        self.deaths = 0
+        self.births = 0
+        self.effects = []          # (x, y, 남은시간, 색, 종류)
+
+    def alive(self):
+        return [b for b in self.balls if b.alive]
+
+    def step(self, dt):
+        self.time += dt
+        balls = self.alive()
+
+        for b in balls:
+            b.age += dt
+            b.flash = max(0.0, b.flash - dt)
+            b.hp = min(b.max_hp, b.hp + b.regen * dt)
+            b.decide_timer += dt
+            if b.decide_timer >= b.decide_interval:
+                b.decide(balls)
+            if b.target is not None and not b.target.alive:
+                b.target = None
+
+        # 이동
+        grid = Grid(balls)
+        for b in balls:
+            dx, dy = self.move_dir(b, balls, grid)
+            b.x += dx * b.speed * dt
+            b.y += dy * b.speed * dt
+
+        # 겹침 풀기
+        grid = Grid(balls)
+        for a in balls:
+            for c in grid.near(a.x, a.y, RADIUS * 2):
+                if c.id <= a.id:                 # 같은 쌍을 두 번 처리하지 않게
+                    continue
+                ddx, ddy = a.delta_to(c)
+                d = math.hypot(ddx, ddy)
+                if 0 < d < RADIUS * 2:
+                    push = (RADIUS * 2 - d) / 2
+                    ux, uy = ddx / d, ddy / d
+                    a.x -= ux * push
+                    a.y -= uy * push
+                    c.x += ux * push
+                    c.y += uy * push
+        for b in balls:                      # 판 밖으로 나가면 반대편에서 나온다
+            b.x %= BOARD_W
+            b.y %= BOARD_H
+
+        # 공격: 사정거리 안에 있으면 행동과 상관없이 공격한다
+        reach = RADIUS * 2 + ATTACK_GAP
+        grid = Grid(balls)
+        dead = []
+        for b in balls:
+            b.cooldown -= dt
+            if b.cooldown > 0 or not b.alive:
+                continue
+            in_range = [o for o in grid.near(b.x, b.y, reach)
+                        if o is not b and o.alive and b.dist_to(o) <= reach]
+            if not in_range:
+                continue
+            victim = b.target if b.target in in_range else min(in_range, key=lambda o: o.hp)
+            damage = b.atk - victim.defense
+            if damage <= 0:              # 방어력이 공격력 이상이면 1 피해
+                damage = 1
+            victim.hp -= damage
+            victim.flash = 0.12
+            b.cooldown = 1 / b.aspd
+            hdx, hdy = b.delta_to(victim)
+            self.effects.append([(b.x + hdx / 2) % BOARD_W, (b.y + hdy / 2) % BOARD_H, 0.15, (255, 255, 255), "hit"])
+            if victim.hp <= 0 and victim.alive:
+                victim.alive = False
+                dead.append((victim, b))
+
+        for victim, killer in dead:
+            self.on_death(victim, killer)
+
+        self.effects = [e for e in self.effects if (e.__setitem__(2, e[2] - dt) or e[2] > 0)]
+
+    def move_dir(self, b, balls, grid):
+        if len(balls) < 2:
+            return 0.0, 0.0
+        if b.behavior == "chase":
+            if b.target is None:
+                b.target = min((o for o in balls if o is not b), key=b.dist_to)
+            t = b.target
+            tdx, tdy = b.delta_to(t)            # 경계 너머가 더 가까우면 그쪽으로 간다
+            d = math.hypot(tdx, tdy)
+            if d <= RADIUS * 2 + ATTACK_GAP * 0.5:
+                return 0.0, 0.0
+            return tdx / d, tdy / d
+        if b.behavior == "flee":
+            fx = fy = 0.0
+            for o in grid.near(b.x, b.y, SENSE):
+                if o is b:
+                    continue
+                odx, ody = b.delta_to(o)           # 경계 너머에 있는 상대도 감지한다
+                d = math.hypot(odx, ody)
+                if 0 < d < SENSE:
+                    w = 1 / (d * d)
+                    fx -= odx / d * w
+                    fy -= ody / d * w
+            n = math.hypot(fx, fy)
+            if n == 0:
+                return 0.0, 0.0
+            return fx / n, fy / n
+        return 0.0, 0.0                 # 대기: 제자리에서 다가오는 상대를 맞이
+
+    def on_death(self, victim, killer):
+        self.deaths += 1
+        self.effects.append([victim.x, victim.y, 0.6, victim.color, "death"])
+        balls = self.alive()
+
+        # 죽인 공: 자식 생성 + 행동 갱신
+        child = None
+        if killer.alive:
+            killer.kills += 1
+            spot = free_spot(balls, near=killer, dist_range=CHILD_DIST) or free_spot(balls)
+            if spot:
+                child = Ball(spot[0], spot[1], child_points(killer.points),
+                             child_weights(killer.weights),
+                             generation=killer.generation + 1, parent=killer.id)
+                self.balls.append(child)
+                self.births += 1
+                self.effects.append([child.x, child.y, 0.5, child.color, "birth"])
+                balls.append(child)
+                child.decide(balls)
+            if killer.dist_to(victim) <= NEAR_DEATH:
+                killer.decide(balls, event=True)
+
+        # 바로 근처(지름 3개 거리)에서 누가 죽었으면 행동 갱신
+        for b in balls:
+            if b is not killer and b is not child and b.dist_to(victim) <= NEAR_DEATH:
+                b.decide(balls, event=True)
+
+        self.balls = [b for b in self.balls if b.alive]
+
+
+# ------------------------------------------------------------------ 화면 ----
+def get_font(size):
+    for name in ["malgungothic", "applegothic", "nanumgothic", "notosanscjkkr", "gulim"]:
+        path = pygame.font.match_font(name)
+        if path:
+            return pygame.font.Font(path, size)
+    return pygame.font.SysFont(None, size + 4)
+
+
+def draw(screen, world, fonts, selected, speed_mult, paused):
+    small, mid, big = fonts
+    screen.fill(BG)
+    board = screen.subsurface((0, 0, BOARD_W, BOARD_H))   # 판 밖(패널)으로 그림이 새지 않게
+
+    def copies(x, y, margin):
+        """경계에 걸친 것은 반대편에도 같이 그린다."""
+        xs = [x] + ([x + BOARD_W] if x < margin else []) + ([x - BOARD_W] if x > BOARD_W - margin else [])
+        ys = [y] + ([y + BOARD_H] if y < margin else []) + ([y - BOARD_H] if y > BOARD_H - margin else [])
+        return [(int(cx), int(cy)) for cx in xs for cy in ys]
+
+    for x, y, t, color, kind in world.effects:
+        if kind == "hit":
+            for pos in copies(x, y, 4):
+                pygame.draw.circle(board, color, pos, 3)
+        elif kind == "death":
+            r = int(RADIUS + (0.6 - t) * 60)
+            for pos in copies(x, y, r + 2):
+                pygame.draw.circle(board, color, pos, r, 2)
+        elif kind == "birth":
+            r = int(RADIUS + t * 30)
+            for pos in copies(x, y, r + 2):
+                pygame.draw.circle(board, (255, 255, 255), pos, r, 1)
+
+    for b in world.alive():
+        if b is selected and b.target is not None and b.target.alive:
+            # 경계 너머로 쫓는 중이면 선도 경계를 넘어 그린다
+            tdx, tdy = b.delta_to(b.target)
+            for pos in copies(b.x, b.y, max(abs(tdx), abs(tdy)) + 1):
+                pygame.draw.line(board, (255, 90, 90), pos, (int(pos[0] + tdx), int(pos[1] + tdy)), 1)
+        color = (255, 255, 255) if b.flash > 0 else b.color
+        mark = small.render(BEHAVIOR_MARK[b.behavior], True, (20, 20, 25))
+        w = RADIUS * 2
+        frac = max(0.0, b.hp / b.max_hp)
+        for pos in copies(b.x, b.y, RADIUS + 10):
+            if b is selected:
+                pygame.draw.circle(board, (255, 255, 255), pos, RADIUS + 5, 2)
+            pygame.draw.circle(board, color, pos, RADIUS)
+            board.blit(mark, mark.get_rect(center=pos))
+            # 체력바
+            pygame.draw.rect(board, (60, 20, 20), (pos[0] - RADIUS, pos[1] - RADIUS - 8, w, 4))
+            pygame.draw.rect(board, (90, 220, 110), (pos[0] - RADIUS, pos[1] - RADIUS - 8, int(w * frac), 4))
+
+    # 패널
+    px = BOARD_W
+    pygame.draw.rect(screen, PANEL_BG, (px, 0, PANEL_W, BOARD_H))
+    y = 14
+
+    def line(text, font=mid, color=TEXT, dy=None):
+        nonlocal y
+        surf = font.render(text, True, color)
+        screen.blit(surf, (px + 16, y))
+        y += dy if dy is not None else surf.get_height() + 4
+
+    alive = world.alive()
+    status = "일시정지" if paused else f"{speed_mult}배속"
+    line(f"시간 {world.time:6.1f}초   {status}", big)
+    line(f"생존 {len(alive)}   사망 {world.deaths}   탄생 {world.births}")
+    if alive:
+        line(f"최고 세대 {max(b.generation for b in alive)}")
+    line("색: 빨강 추격 · 초록 도망 · 파랑 대기", small, DIM)
+    line("글자(지금 행동): F 도망 · C 추격 · W 대기", small, DIM)
+    y += 6
+
+    # 평균 능력치 (진화 방향을 보기 위함)
+    line("살아있는 공 평균", mid, DIM)
+    if alive:
+        for key, name, base, inc in STATS:
+            avg_pts = sum(b.points[key] for b in alive) / len(alive)
+            line(f"  {name:<5} {avg_pts:5.1f}p  ({base + inc * avg_pts:6.1f})", small)
+        avg_w = [sum(b.weights[i] for b in alive) / len(alive) for i in range(3)]
+        line(f"  행동  도망 {avg_w[0]:.2f} 추격 {avg_w[1]:.2f} 대기 {avg_w[2]:.2f}", small)
+        line(f"  포인트 합 {sum(b.total_points for b in alive) / len(alive):5.1f}", small)
+    y += 10
+
+    if selected is not None and selected.alive:
+        b = selected
+        pygame.draw.circle(screen, b.color, (px + 26, y + 10), 9)
+        surf = mid.render(f"  #{b.id}  {b.generation}세대  처치 {b.kills}", True, TEXT)
+        screen.blit(surf, (px + 30, y))
+        y += surf.get_height() + 6
+        line(f"행동: {BEHAVIOR_KO[b.behavior]}   다음 갱신 {b.decide_interval - b.decide_timer:4.1f}초", small)
+        line(f"체력 {b.hp:6.1f} / {b.max_hp:.0f}", small)
+        vals = [b.max_hp, b.regen, b.atk, b.defense, b.aspd, b.speed / MOVE_SCALE]
+        for (key, name, *_), v in zip(STATS, vals):
+            line(f"  {name:<5} {v:7.2f}   ({b.points[key]}p)", small)
+        line(f"  포인트 합 {b.total_points}", small)
+        line(f"  가중치  도망 {b.weights[0]:.2f} 추격 {b.weights[1]:.2f} 대기 {b.weights[2]:.2f}", small)
+    else:
+        line("공을 클릭하면 능력치를 볼 수 있어요", small, DIM)
+
+    y = BOARD_H - 26
+    line("Space 정지  1~5 배속  R 재시작", small, DIM)
+
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((BOARD_W + PANEL_W, BOARD_H))
+    pygame.display.set_caption("Ball Battle")
+    clock = pygame.time.Clock()
+    fonts = (get_font(14), get_font(17), get_font(21))
+
+    world = World()
+    selected = None
+    paused = False
+    speed_mult = 1
+    running = True
+
+    while running:
+        frame_dt = clock.tick(60) / 1000
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_SPACE:
+                    paused = not paused
+                elif event.key == pygame.K_r:
+                    world, selected = World(), None
+                elif pygame.K_1 <= event.key <= pygame.K_5:
+                    speed_mult = 2 ** (event.key - pygame.K_1)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                mx, my = event.pos
+                hits = [b for b in world.alive() if wrap_dist(b.x, b.y, mx, my) <= RADIUS + 4]
+                selected = hits[0] if hits else None
+
+        if not paused:
+            # 배속이 높아도 계산이 튀지 않게 작은 단계로 나눠 진행
+            steps = speed_mult
+            for _ in range(steps):
+                world.step(min(frame_dt, 1 / 30))
+
+        draw(screen, world, fonts, selected, speed_mult, paused)
+        pygame.display.flip()
+
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
